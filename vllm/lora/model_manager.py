@@ -46,6 +46,7 @@ from vllm.model_executor.models import (
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import PPMissingLayer
+from vllm.model_executor.utils import get_moe_expert_mapping
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.utils.cache import LRUCache
@@ -160,9 +161,25 @@ class LoRAModelManager:
         self._enable_moe_shared_loras = is_moe and lora_config.enable_moe_shared_loras
         self.packed_modules_mapping = process_packed_modules_mapping(
             self.model,
-            force_2d_moe=self._enable_mixed_moe_lora_format,
             enable_moe_shared_loras=self._enable_moe_shared_loras,
         )
+        # (name, expert_id, shard_id) for per-expert (2D) adapter weights. The 2D
+        # path is used when the model is 2D, or when enable_mixed_moe_lora_format
+        # forces the universal 2D wrapper so 3D models can also load 2D adapters.
+        self.expert_mapping: list[tuple[str, int, str]] = []
+        if (
+            is_moe
+            and not self._enable_moe_shared_loras
+            and (not self.model.is_3d_moe_weight or self._enable_mixed_moe_lora_format)
+        ):
+            self.expert_mapping = [
+                (weight_name.rstrip("."), expert_id, shard_id)
+                for _, weight_name, expert_id, shard_id in get_moe_expert_mapping(
+                    self.model
+                )
+                # Non-gated MoE has an empty ckpt_up_proj_name, giving "experts.0.."
+                if ".." not in weight_name
+            ]
         self._is_non_gated_moe = is_moe and self.model.is_non_gated_moe
         self._use_ep = bool(
             vllm_config and vllm_config.parallel_config.enable_expert_parallel
@@ -723,12 +740,13 @@ class LoRAModelManager:
                     model.loras[module_name] = lora
             else:
                 parts = module_name.split(".")
-                replacements = self.packed_modules_mapping[parts[-1]]
-                n_slices = getattr(module, "n_slices", len(replacements))
                 if module.__class__.__name__ == "FusedMoEWithLoRA":
-                    replacements = replacements[
-                        : len(module.lora_a_stacked) // self.lora_slots
-                    ]
+                    # One dummy LoRA per local expert and projection
+                    n_dummies = len(module.lora_a_stacked) // self.lora_slots
+                    replacements = [f"slice_{i}" for i in range(n_dummies)]
+                else:
+                    replacements = self.packed_modules_mapping[parts[-1]]
+                n_slices = getattr(module, "n_slices", len(replacements))
                 subloras: list[LoRALayerWeights | None] = []
                 # HACK: overrides replacements for qkvz = qkv + z case.
                 # Any better methods to handle this case?
@@ -830,6 +848,10 @@ class LoRAModelManager:
     def _register_packed_modules(self, module_full_name: str) -> None:
         parts = module_full_name.split(".")
         module_name = parts[-1]
+        if module_name == "experts" and self.expert_mapping:
+            # Packed by `_pack_expert_loras` using `self.expert_mapping`
+            self.packed_modules[module_full_name] = []
+            return
         replacements = self.packed_modules_mapping.get(module_name, [])
         # When replacements is less than or equal to 1, it indicates that this
         # module is not a packed module.
@@ -842,14 +864,9 @@ class LoRAModelManager:
 
     def _create_merged_loras_inplace(self, lora_model: LoRAModel) -> None:
         for module_name, new_module_names in self.packed_modules.items():
-            # For 2D RoutedExperts modules with EP, narrow the per-expert
-            # sub-module list to this rank's owned experts so pack_moe
-            # produces a tensor sized to local_num_experts directly.
-            packed_module_names = new_module_names
-            if module_name.endswith(".experts"):
-                new_module_names = self._restrict_to_local_experts(
-                    module_name, new_module_names
-                )
+            if module_name.endswith(".experts") and self.expert_mapping:
+                self._pack_expert_loras(lora_model, module_name)
+                continue
             replacement_loras: list[LoRALayerWeights | None] = []
             has_replacement = False
             for r in new_module_names:
@@ -868,18 +885,13 @@ class LoRAModelManager:
                 replaced_module_name = module_name.removeprefix("model.")
                 if lora_model.check_lora_name(replaced_module_name):
                     module_name = replaced_module_name
-            if module_name.endswith(".experts"):
-                if self._enable_moe_shared_loras:
-                    lora_model.loras[module_name] = (
-                        PackedLoRALayerWeights.pack_moe_stacked(
-                            replacement_loras,
-                            module_name,
-                        )
-                    )
-                    for module in packed_module_names:
-                        lora_model.loras.pop(module, None)
-                    continue
-                if self._is_non_gated_moe and len(replacement_loras) > 0:
+            if module_name.endswith(".experts") and self._enable_moe_shared_loras:
+                lora_model.loras[module_name] = PackedLoRALayerWeights.pack_moe_stacked(
+                    replacement_loras,
+                    module_name,
+                )
+            elif module_name.endswith(".experts"):
+                if self._is_non_gated_moe:
                     replacement_loras = self._pad_lora_pairs_to_triplets(
                         replacement_loras
                     )
@@ -892,11 +904,7 @@ class LoRAModelManager:
                 lora_model.loras[module_name] = PackedLoRALayerWeights.pack(
                     replacement_loras
                 )
-            # Drop every candidate sub-module, including non-local expert
-            # entries that were loaded but did not contribute to the
-            # packed result. Without this they would keep extra CPU
-            # memory alive after pack_moe.
-            for module in packed_module_names:
+            for module in new_module_names:
                 lora_model.loras.pop(module, None)
 
         for lora in lora_model.loras.values():
@@ -1166,40 +1174,44 @@ class LoRAModelManager:
         module_lora.lora_a = [_slice_local(a) for a in module_lora.lora_a]
         module_lora.lora_b = [_slice_local(b) for b in module_lora.lora_b]
 
-    def _restrict_to_local_experts(
-        self, module_name: str, new_module_names: list[str]
-    ) -> list[str]:
-        """Narrow a flat expert-major sub-module list to this rank's experts.
+    def _pack_expert_loras(self, lora_model: LoRAModel, module_name: str) -> None:
+        """Pack the per-expert LoRAs of `module_name`, placed by expert and shard.
 
-        ``new_module_names`` is produced by
-        ``fused_moe_make_expert_params_mapping`` and is ordered
-        ``[e=0,w1, e=0,w2, e=0,w3, e=1,w1, ...]`` (non-gated MoE has 2
-        entries per expert instead of 3). When the module is a 2D
-        ``FusedMoEWithLoRA`` with EP enabled, we slice the list to the
-        contiguous block of experts owned by this rank so the downstream
-        ``pack_moe`` call only consumes local weights and produces a
-        tensor sized to ``local_num_experts`` directly.
-
-        Returns the original list unchanged for non-MoE modules, the 3D
-        MoE path (handled separately by ``_stack_moe_lora_weights``),
-        modules without EP, or layouts we cannot cleanly partition.
+        Each expert weight takes the first of its checkpoint names present in the
+        adapter, so models that accept several naming schemes (e.g. `gate_proj`
+        and `w1`) work with adapters in any of them. Only local experts are packed.
         """
+        prefix = module_name.removesuffix("experts")
+        experts = self._local_experts(module_name)
+        loras: dict[tuple[int, str], LoRALayerWeights] = {}
+        for name, expert_id, shard_id in self.expert_mapping:
+            if expert_id not in experts or (expert_id, shard_id) in loras:
+                continue
+            if lora := self._get_lora_layer_weights(lora_model, prefix + name):
+                loras[(expert_id, shard_id)] = lora
+        if loras:
+            # HACK Temporary solution for the pool model.
+            if self.is_pooling_model and not lora_model.check_lora_name(module_name):
+                replaced_module_name = module_name.removeprefix("model.")
+                if lora_model.check_lora_name(replaced_module_name):
+                    module_name = replaced_module_name
+            lora_model.loras[module_name] = PackedLoRALayerWeights.pack_moe(
+                [loras.get((e, s)) for e in experts for s in ("w1", "w2", "w3")],
+                module_name,
+                is_non_gated_moe=self._is_non_gated_moe,
+            )
+        # Drop every candidate, including non-local experts and unused names, so
+        # they don't keep CPU memory alive after packing
+        for name, _, _ in self.expert_mapping:
+            lora_model.loras.pop(prefix + name, None)
+
+    def _local_experts(self, module_name: str) -> range:
+        """Physical expert ids owned by this rank for `module_name`."""
         module = self.modules.get(module_name)
-        if not isinstance(module, FusedMoEWithLoRA):
-            return new_module_names
-        if isinstance(module, FusedMoE3DWithLoRA):
-            return new_module_names
-        if not getattr(module, "use_ep", False):
-            return new_module_names
-        global_num_experts = module.global_num_experts
-        local_num_experts = module.local_num_experts
-        ep_rank = module.ep_rank
-        if global_num_experts <= 0 or len(new_module_names) % global_num_experts != 0:
-            return new_module_names
-        per_expert = len(new_module_names) // global_num_experts
-        start = ep_rank * local_num_experts * per_expert
-        end = start + local_num_experts * per_expert
-        return new_module_names[start:end]
+        if isinstance(module, FusedMoEWithLoRA) and getattr(module, "use_ep", False):
+            start = module.ep_rank * module.local_num_experts
+            return range(start, start + module.local_num_experts)
+        return range(max(e for _, e, _ in self.expert_mapping) + 1)
 
     def _build_moe_ep_load_spec(self) -> MoEEPLoadSpec | None:
         """Per-rank slicing metadata for 2D RoutedEXperts LoRA modules."""

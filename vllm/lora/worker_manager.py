@@ -115,6 +115,9 @@ class WorkerLoRAManager:
                     expected_lora_lst.append(module)
                 if module == "experts":
                     expected_lora_lst.append(module)
+                    expected_lora_lst.extend(
+                        name for name, _, _ in self._adapter_manager.expert_mapping
+                    )
             expected_lora_modules = set(expected_lora_lst)
             lora_path = get_adapter_absolute_path(lora_request.lora_path)
 

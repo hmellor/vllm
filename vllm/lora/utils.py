@@ -37,7 +37,7 @@ from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.utils import get_moe_expert_mapping, get_packed_modules_mapping
+from vllm.model_executor.utils import get_packed_modules_mapping
 from vllm.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
@@ -384,20 +384,12 @@ def get_adapter_absolute_path(lora_path: str) -> str:
 
 def process_packed_modules_mapping(
     model: nn.Module,
-    force_2d_moe: bool = False,
     enable_moe_shared_loras: bool = False,
 ) -> dict[str, list[str]]:
     if is_moe_model(model):
-        # This method generates and returns a dictionary mapping packed module
-        # names to lists of their corresponding submodule names. It includes
-        # both static mappings and dynamic mappings for expert layers, where
-        # the expert indices are expanded based on the configured number
-        # of routed experts.
         packed_modules_mapping = get_packed_modules_mapping(model)
-        # The 2D mapping is needed when the model itself is 2D, or when
-        # the engine forces the universal 2D wrapper via
-        # enable_mixed_moe_lora_format (so 3D models can also load 2D
-        # adapters through FusedMoEWithLoRA).
+        # Per-expert (2D) adapters are matched against the model's expert
+        # mapping directly, see `LoRAModelManager.expert_mapping`
         if enable_moe_shared_loras:
             # Shared MoE adapters store one pre-stacked tensor per
             # expert-projection (experts.w1/w2/w3) rather than a per-expert
@@ -407,15 +399,6 @@ def process_packed_modules_mapping(
                 "experts.w1",
                 "experts.w2",
                 "experts.w3",
-            ]
-        elif (not model.is_3d_moe_weight) or force_2d_moe:
-            # Filter out malformed entries: non-gated MoE has empty
-            # ckpt_up_proj_name which results in weight_name containing ".."
-            # (e.g., "experts.0.." instead of "experts.0.layer_name.")
-            packed_modules_mapping["experts"] = [
-                weight_name.rstrip(".")
-                for _, weight_name, _, _ in get_moe_expert_mapping(model)
-                if ".." not in weight_name
             ]
 
         return packed_modules_mapping
